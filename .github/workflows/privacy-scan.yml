@@ -1,0 +1,30 @@
+name: privacy-scan
+on: [push, pull_request]
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: No LAN IP / SSID / account in tracked files
+        env:
+          # Literal terms (home SSID, account, device serial prefix) live in the
+          # PRIVACY_TERMS repository secret: a public workflow must not publish them.
+          PRIVACY_TERMS: ${{ secrets.PRIVACY_TERMS }}
+        run: |
+          pattern='192\.168\.[0-9]+\.[0-9]+'
+          if [ -n "$PRIVACY_TERMS" ]; then pattern="$pattern|$PRIVACY_TERMS"; fi
+          hits=$(git grep -nIE "$pattern" -- . ':!.github/workflows/privacy-scan.yml' || true)
+          # Upstream docs examples explicitly allowed by the release gate.
+          hits=$(printf '%s\n' "$hits" | grep -vE '192\.168\.(1|2)\.100' || true)
+          if [ -n "$hits" ]; then echo "$hits"; exit 1; fi
+      - name: Built binary has no LAN IP or SSID (local gate)
+        env:
+          PRIVACY_TERMS: ${{ secrets.PRIVACY_TERMS }}
+        run: |
+          if [ -f build/merged-binary.bin ]; then
+            pattern='192\.168\.'
+            if [ -n "$PRIVACY_TERMS" ]; then pattern="$pattern|$PRIVACY_TERMS"; fi
+            if strings build/merged-binary.bin | grep -qE "$pattern"; then
+              strings build/merged-binary.bin | grep -E "$pattern"; exit 1
+            fi
+          fi

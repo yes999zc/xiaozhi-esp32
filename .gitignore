@@ -1,0 +1,26 @@
+tmp/
+# components/ holds locally fetched / scratch components and is not tracked.
+# Exception: lvgl_kawaii_face is a vendored source dependency of the
+# chd-esp32s3-box persona face (M7-S1) and must be committed.
+# NB: a bare "components/" would ignore the directory itself, and git cannot
+# re-include anything below an ignored directory - hence the components/* form.
+components/*
+!components/lvgl_kawaii_face/
+managed_components/
+build/
+dist/
+.vscode/
+.devcontainer/
+sdkconfig.old
+sdkconfig
+dependencies.lock
+.env
+releases/
+main/assets/lang_config.h
+main/mmap_generate_emoji.h
+.DS_Store
+.cache
+*.pyc
+*.bin
+mmap_generate_*.h
+.clangd

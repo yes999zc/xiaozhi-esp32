@@ -1,0 +1,39 @@
+{
+    "manufacturer": "chd",
+    "type": "chd-esp32s3-box",
+    "target": "esp32s3",
+    "builds": [
+        {
+            "name": "chd-esp32s3-box",
+            "sdkconfig_append": [
+                "CONFIG_USE_DEVICE_AEC=y"
+            ]
+        },
+        {
+            "name": "chd-esp32s3-box-lcd35",
+            "sdkconfig_append": [
+                "CONFIG_USE_DEVICE_AEC=y",
+                "CONFIG_CHD_ESP32S3_BOX_LCD_35=y",
+                "CONFIG_OTA_URL=\"${XIAOZHI_OTA_BASE}/xiaozhi/ota/\"",
+                "CONFIG_LV_DEF_REFR_PERIOD=20",
+                "CONFIG_LV_INV_BUF_SIZE=128"
+            ]
+        },
+        {
+            "comment": "M7-S1B A/B variant: official esp_emote_expression animation (EAF) instead of the LVGL UI + self-drawn kawaii face. The emote engine takes over panel + flush_cb, so LVGL widgets (top/status bar, subtitles) are gone; the panel layout comes from the 320_240 asset layout.",
+            "name": "chd-esp32s3-box-lcd35-emote",
+            "sdkconfig_append": [
+                "CONFIG_USE_DEVICE_AEC=y",
+                "CONFIG_CHD_ESP32S3_BOX_LCD_35=y",
+                "CONFIG_OTA_URL=\"${XIAOZHI_OTA_BASE}/xiaozhi/ota/\"",
+                "CONFIG_LV_DEF_REFR_PERIOD=20",
+                "CONFIG_LV_INV_BUF_SIZE=128",
+                "CONFIG_USE_DEFAULT_MESSAGE_STYLE=n",
+                "CONFIG_USE_WECHAT_MESSAGE_STYLE=n",
+                "CONFIG_USE_EMOTE_MESSAGE_STYLE=y",
+                "CONFIG_FLASH_EXPRESSION_ASSETS=y",
+                "CONFIG_FLASH_DEFAULT_ASSETS=n"
+            ]
+        }
+    ]
+}
