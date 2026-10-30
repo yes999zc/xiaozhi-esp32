@@ -330,6 +330,17 @@ y 312..320   底部留白 8
 ### 3. 如何恢复出厂设置？
 按 Boot 按键 5次，设备会清除所有配置并重启。
 
+### 4. A 视图底部的恐龙条不见了？
+先确认板上跑的是不是新镜像——2026-10-30 的现场是**旧 app 留在板上**，换成新编的 app 后
+A 视图左下恐龙 + 仙人掌立即恢复（截图证据见服务端仓 HANDOFF）。
+
+代码上它本该始终可见：`dino_root_` 建在 `(0,273)`、480×47（`chd_esp32s3_box_board.cc:1196-1216`），
+`ApplyViewLayout()` 的 `is_a` 分支 `remove_flag(HIDDEN)` + `move_foreground`（同文件 `:1440-1447`），
+`ADinoTick` 每 80 ms 再确认一次（`:1802-1805`）。只有四类**瞬时**门会把它藏起来：非 A 视图、
+`media_active_`（仅预览图片期间）、`speaking` / 字幕条可见。这些门都会自解，不会永久隐藏。
+诊断时先 `self.screen.set_view {view:0}` 再 `self.screen.snapshot {url:<...>/debug/upload}` 截图，
+别先怀疑渲染逻辑。
+
 ## M7-S1 换脸 spike（persona face）
 
 本板默认 UI 的脸被替换为 `lvgl_kawaii_face` 的程序化圆脸（会眨眼、可平滑换表情）。
