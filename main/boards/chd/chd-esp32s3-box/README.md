@@ -9,7 +9,7 @@ chd-esp32s3-box AIoT 开发套件，搭载 ESP32-S3-WROOM-1 模组，配备 2.8 
 - **显示屏**: 2.8 英寸 LCD (320x240, ST7789)
 - **音频**: ES8311 音频 Codec + ES7210 双麦 ADC
 - **音频功能**: 支持设备端 AEC (回声消除)
-- **按键**: Boot 按键 (单击/双击功能)
+- **按键**: BOOT 单击 = 开始/结束对话，长按 3 s = 恢复出厂
 - **其他**: USB-C 供电与通信，锂电池供电、支持ml307-4G
 
 ## 配置、编译命令
@@ -38,7 +38,7 @@ idf.py menuconfig
 
 ESP-BOX-3 硬件支持设备端 AEC 功能，可有效消除扬声器播放声音对麦克风的干扰，提升语音识别准确率。
 
-**运行时切换**: 双击 Boot 按键可在运行时开启/关闭 AEC 功能。
+**运行时切换**: AEC 在编译期由 `CONFIG_USE_DEVICE_AEC=y` 开启，运行期不提供按键切换（本板未注册多击回调）。
 
 > **说明**: 设备端 AEC 需要干净的扬声器输出参考路径和良好的麦克风与扬声器物理隔离才能正常工作。ESP-BOX-3 硬件已做优化设计。
 
@@ -132,12 +132,10 @@ idf.py flash
   已知恢复方式 = 重启。现场看心跳 `kept_last=1` / `state=PRESSED` 判断；下次触摸改动可再加 20 s watchdog
   （本次不加，避免改变已验证行为）。
 
-### 卡持续读写时「不会误触发对话」怎么验
-1. 串口/日志里所有对话切换都带来源：`CHD_UI: tap -> ...` / `CHD_UI: face tap -> ...` / `CHD_UI: Swipe Up detected`。
-   按键路径已删除，所以**没有任何来源的对话切换 = 不可能发生**。
-2. 内置压测工具（MCP）：`self.debug.sd_storm(seconds=30)` → 后台任务连续读 `/sdcard/_sdtest_storm.bin`，
-   每秒打 `CHD_SD: storm: N s, ... KiB/s, total ... KiB`，结束时打 `storm: STOP`。
-   **判读**：`storm: START` 到 `STOP` 之间若没有 `CHD_UI:` 行 → SD 流量没有误触发对话。
+### 对话切换的已知来源（抓日志时按来源判读）
+`CHD_UI: tap -> ...`（屏幕分区）、`CHD_UI: face tap -> ...`、`CHD_UI: Swipe Up detected`、
+`CHD_UI: BOOT -> ...`（BOOT 短按）。TF/SD 已取消，相关压测工具随之删除；
+若日志出现**没有来源**的 `ToggleChatState`，按串口/触摸状态另查。
 
 ### 恢复路径（刷坏怎么办）
 1. **USB-C 串口刷机始终可用**：本板 console 在 **USB-Serial-JTAG**（`CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y`），
@@ -152,7 +150,7 @@ idf.py flash
 
 厂商引脚表里 `SD_CMD=IO0`（同时是 **BOOT strap**）、`SD_CLK=IO43`（UART0 TXD）、`SD_DAT0=IO44`
 （UART0 RXD）。为了把 IO0 还给 BOOT 键（触摸唤醒太费劲），本板**移除全部 TF/SD 代码**：
-`CHD_SD_ENABLE` 宏、探测任务、`self.debug.sd_storm` 工具与相关 include 都已删除。
+`CHD_SD_ENABLE` 宏、探测任务、压测工具与相关 include 都已删除。
 
 - **IO0**：归 BOOT 键（短按对话、长按 3 s 恢复出厂）。
 - **IO43/IO44**：不再被 SD 驱动占用，UART0 控制台可正常用（之前 SD 占用时日志会乱码）。

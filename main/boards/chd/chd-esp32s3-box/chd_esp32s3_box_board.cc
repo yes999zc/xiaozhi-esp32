@@ -3058,8 +3058,12 @@ private:
         const esp_partition_t* ota = esp_partition_find_first(
             ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_OTA, nullptr);
         if (ota != nullptr) {
-            esp_partition_erase_range(ota, 0, ota->size);
-            ESP_LOGI(TAG, "erased otadata partition");
+            esp_err_t erased = esp_partition_erase_range(ota, 0, ota->size);
+            if (erased == ESP_OK) {
+                ESP_LOGI(TAG, "erased otadata partition");
+            } else {
+                ESP_LOGE(TAG, "erasing otadata failed: %s", esp_err_to_name(erased));
+            }
         } else {
             ESP_LOGE(TAG, "otadata partition not found");
         }
