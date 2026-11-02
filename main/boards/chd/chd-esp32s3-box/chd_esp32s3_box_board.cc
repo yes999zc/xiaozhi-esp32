@@ -2769,10 +2769,30 @@ static void IndevActTimerCb(lv_timer_t* timer) {
 // Installed over the driver callback: only LVGL's indev path goes through this,
 // so counting here measures exactly what LVGL polls, and the phantom filter is
 // applied once per poll inside the LVGL task (same lock).
+// A cold boot (ON switch) can catch the touch controller before it answers on
+// I2C. esp_lvgl_port wraps this call in ESP_ERROR_CHECK (esp_lvgl_port_touch.c:127),
+// so returning a transient I2C error here aborts and reboots the board - the
+// 2026-11-02 boot loop. Report "no points" instead: a missed frame is harmless,
+// a reboot loop is not.
+static int64_t s_touch_last_err_log_us = 0;
+
 static esp_err_t TouchCountedRead(esp_lcd_touch_handle_t tp) {
     s_touch_indev_reads = s_touch_indev_reads + 1;  // volatile: C++20 forbids ++
     const esp_err_t err =
         (s_touch_read_orig != nullptr) ? s_touch_read_orig(tp) : ESP_ERR_INVALID_STATE;
+    if (err != ESP_OK) {
+        if (tp != nullptr) {
+            tp->data.points = 0;   // never report a stale press
+        }
+        const int64_t now_us = esp_timer_get_time();
+        if (now_us - s_touch_last_err_log_us > 5 * 1000 * 1000) {
+            s_touch_last_err_log_us = now_us;
+            s_touch_poll_fails = s_touch_poll_fails + 1;
+            ESP_LOGW("CHD_TOUCH", "touch read failed (%s): reporting no points",
+                     esp_err_to_name(err));
+        }
+        return ESP_OK;
+    }
 #if CHD_TOUCH_PHANTOM_FILTER
     if (err == ESP_OK) {
         TouchFilterApply(tp);
@@ -3350,11 +3370,32 @@ private:
         };
         tp_io_config.scl_speed_hz = 400000;
 
+        // Cold boot: give the controller up to ~1 s to answer before handing the
+        // handle to LVGL. Without touch the device still works (BOOT/voice/OTA).
+        bool touch_ready = false;
+        for (int attempt = 0; attempt < 10 && !touch_ready; ++attempt) {
+            touch_ready = (i2c_master_probe(i2c_bus_, ESP_LCD_TOUCH_IO_I2C_FT5x06_ADDRESS, 50) == ESP_OK);
+            if (!touch_ready) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+        }
+        if (!touch_ready) {
+            ESP_LOGE("CHD_TOUCH", "FT5x06 did not answer on I2C - booting without touch");
+            return false;
+        }
+
         esp_lcd_new_panel_io_i2c(i2c_bus_, &tp_io_config, &tp_io_handle);
         esp_err_t tp_err = esp_lcd_touch_new_i2c_ft5x06(tp_io_handle, &tp_cfg, &tp);
         ESP_LOGI("CHD_TOUCH", "esp_lcd_touch_new_i2c_ft5x06 -> %s (0x%x)", esp_err_to_name(tp_err),
                  static_cast<unsigned>(tp_err));
-        assert(tp);
+        if (tp_err != ESP_OK || tp == nullptr) {
+            ESP_LOGE("CHD_TOUCH", "touch init failed (%s) - booting without touch",
+                     esp_err_to_name(tp_err));
+            if (tp_io_handle != nullptr) {
+                esp_lcd_panel_io_del(tp_io_handle);
+            }
+            return false;
+        }
 
         /* Add touch input (for selected screen) */
         const lvgl_port_touch_cfg_t touch_cfg = {
