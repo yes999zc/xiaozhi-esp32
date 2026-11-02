@@ -36,6 +36,8 @@ extern "C" {
 #include "power_manager.h"
 
 #include <nvs_flash.h>
+#include <esp_partition.h>
+#include <esp_system.h>
 #include "system_reset.h"
 
 #include "mcp_server.h"
@@ -46,329 +48,6 @@ extern "C" {
 
 #define TAG "Chd-Esp32s3-Box-Board"
 
-// ---------------------------------------------------------------------------
-// TF card smoke test (task-30) - "can this card mount at all on this firmware?"
-//
-// Pins come from the vendor pin table (CHD-ESP32-S3-BOX):
-//   SD_CMD  = IO0   (shared with the BOOT strap pin)
-//   SD_CLK  = IO43  (shared with UART0 TXD)
-//   SD_DAT0 = IO44  (shared with UART0 RXD)
-// Only CMD/CLK/DAT0 are wired, so this can only be 1-bit SDMMC. No card-detect
-// pin exists, so the card is treated as permanently inserted.
-//
-// UART0 console vs. SD_CLK/D0: both console pins are reused, so the UART
-// console output is garbled while the SD driver owns them. Logs still arrive on
-// the USB-Serial-JTAG console (CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y).
-//
-// CHD_SD_ENABLE is the kill switch: pass -DCHD_SD_ENABLE=0 (or edit this define)
-// to build a firmware that never touches IO0/IO43/IO44 - use it if the card
-// holds IO0 low at reset and the board boots into download mode instead of
-// running the app.
-// ---------------------------------------------------------------------------
-#ifndef CHD_SD_ENABLE
-#define CHD_SD_ENABLE 1
-#endif
-
-#if CHD_SD_ENABLE
-#include <dirent.h>
-#include <errno.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
-#include "driver/sdmmc_host.h"
-#include "esp_vfs_fat.h"
-#include "sdmmc_cmd.h"
-
-static constexpr int kSdCmdGpio = 0;   // also BOOT strap: keep the pull-up intact
-static constexpr int kSdClkGpio = 43;  // also UART0 TXD
-static constexpr int kSdD0Gpio = 44;   // also UART0 RXD
-
-static const char* ErrName(esp_err_t err) { return esp_err_to_name(err); }
-
-// Read the three SD lines as inputs with pull-ups before touching the driver:
-// a line that stays low with a pull-up enabled is shorted/pulled by the card or
-// the board (e.g. the BOOT button circuit on IO0), which no amount of retrying
-// will fix. This also covers the "did IO0 keep the chip out of download mode"
-// question for free.
-static void SdPinSanity() {
-    gpio_config_t io = {};
-    io.pin_bit_mask = (1ULL << kSdCmdGpio) | (1ULL << kSdClkGpio) | (1ULL << kSdD0Gpio);
-    io.mode = GPIO_MODE_INPUT;
-    io.pull_up_en = GPIO_PULLUP_ENABLE;
-    io.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    io.intr_type = GPIO_INTR_DISABLE;
-    gpio_config(&io);
-    vTaskDelay(pdMS_TO_TICKS(10));  // let the pull-ups settle
-    ESP_LOGI("CHD_SD", "pin sanity (input+pull-up): IO%d(CMD)=%d IO%d(CLK)=%d IO%d(D0)=%d "
-                       "[a 0 here means the line is held low]",
-             kSdCmdGpio, gpio_get_level(static_cast<gpio_num_t>(kSdCmdGpio)),
-             kSdClkGpio, gpio_get_level(static_cast<gpio_num_t>(kSdClkGpio)),
-             kSdD0Gpio, gpio_get_level(static_cast<gpio_num_t>(kSdD0Gpio)));
-    gpio_reset_pin(static_cast<gpio_num_t>(kSdCmdGpio));
-    gpio_reset_pin(static_cast<gpio_num_t>(kSdClkGpio));
-    gpio_reset_pin(static_cast<gpio_num_t>(kSdD0Gpio));
-}
-
-// One full "clock the card up" attempt at a given frequency. Logs every step so a
-// failure can be attributed: host_init / init_slot / card_init.
-// Returns ESP_OK only if the card answered (CID read), which proves wiring+timing.
-static esp_err_t SdCardProbe(int freq_khz, sdmmc_card_t* card) {
-    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-    host.max_freq_khz = freq_khz;
-
-    sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
-    slot.width = 1;
-    slot.clk = static_cast<gpio_num_t>(kSdClkGpio);
-    slot.cmd = static_cast<gpio_num_t>(kSdCmdGpio);
-    slot.d0 = static_cast<gpio_num_t>(kSdD0Gpio);
-    slot.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
-
-    esp_err_t err = sdmmc_host_init();
-    ESP_LOGI("CHD_SD", "[%d kHz] sdmmc_host_init     -> %s (0x%x)", freq_khz, ErrName(err),
-             static_cast<unsigned>(err));
-    if (err != ESP_OK) {
-        return err;
-    }
-    err = sdmmc_host_init_slot(host.slot, &slot);
-    ESP_LOGI("CHD_SD", "[%d kHz] sdmmc_host_init_slot-> %s (0x%x)", freq_khz, ErrName(err),
-             static_cast<unsigned>(err));
-    if (err != ESP_OK) {
-        sdmmc_host_deinit();
-        return err;
-    }
-    err = sdmmc_card_init(&host, card);
-    ESP_LOGI("CHD_SD", "[%d kHz] sdmmc_card_init    -> %s (0x%x)", freq_khz, ErrName(err),
-             static_cast<unsigned>(err));
-    if (err != ESP_OK) {
-        sdmmc_host_deinit();
-        return err;
-    }
-    return ESP_OK;  // host+slot left up; caller deinits before the FAT stage
-}
-
-// Sector 0 tells "card fine, no filesystem" apart from "card never answered".
-static void SdCheckPartitionTable(sdmmc_card_t* card) {
-    static uint8_t sector0[512] __attribute__((aligned(4)));  // static: keep off the task stack
-    esp_err_t err = sdmmc_read_sectors(card, sector0, 0, 1);
-    if (err != ESP_OK) {
-        ESP_LOGW("CHD_SD", "read sector 0 failed: %s (0x%x)", ErrName(err),
-                 static_cast<unsigned>(err));
-        return;
-    }
-    const bool mbr = sector0[510] == 0x55 && sector0[511] == 0xAA;
-    ESP_LOGI("CHD_SD", "partition table (sector 0): %s [bytes 510/511 = 0x%02x 0x%02x, "
-                       "first part type=0x%02x, start LBA=%u]",
-             mbr ? "PRESENT" : "ABSENT", sector0[511], sector0[510], sector0[450],
-             static_cast<unsigned>(sector0[454]) | (static_cast<unsigned>(sector0[455]) << 8) |
-                 (static_cast<unsigned>(sector0[456]) << 16) |
-                 (static_cast<unsigned>(sector0[457]) << 24));
-}
-
-// Runs in its own task so a missing/slow card can never delay or block boot.
-static void SdSmokeTask(void* arg) {
-    (void)arg;
-    ESP_LOGI("CHD_SD", "probing TF card (1-bit SDMMC: cmd=IO%d clk=IO%d d0=IO%d)",
-             kSdCmdGpio, kSdClkGpio, kSdD0Gpio);
-    SdPinSanity();
-
-    static sdmmc_card_t card;  // ~1 KiB: keep it out of the task stack
-    bool card_ok = false;
-    int used_freq = 0;
-    // Two frequency levels per round: 400 kHz first (timing-forgiving probing
-    // clock), then 20 MHz. 400 kHz OK + 20 MHz failing = signal integrity;
-    // neither working = wiring / power / no card.
-    const int freqs[2] = {SDMMC_FREQ_PROBING, SDMMC_FREQ_DEFAULT};
-    for (int round = 0; round < 3 && !card_ok; round++) {
-        ESP_LOGI("CHD_SD", "--- card init attempt %d/3 ---", round + 1);
-        for (int i = 0; i < 2 && !card_ok; i++) {
-            if (SdCardProbe(freqs[i], &card) == ESP_OK) {
-                card_ok = true;
-                used_freq = freqs[i];
-            } else {
-                vTaskDelay(pdMS_TO_TICKS(200));
-            }
-        }
-    }
-    if (!card_ok) {
-        ESP_LOGE("CHD_SD", "card init FAILED at 400 kHz and 20 MHz, 3 rounds -> "
-                           "wiring/power/card problem, NOT a filesystem problem");
-        vTaskDelete(nullptr);
-        return;
-    }
-
-    ESP_LOGI("CHD_SD", "card answered at %d kHz - wiring and timing are OK", used_freq);
-    sdmmc_card_print_info(stdout, &card);
-    const uint64_t card_bytes =
-        static_cast<uint64_t>(card.csd.capacity) * static_cast<uint64_t>(card.csd.sector_size);
-    ESP_LOGI("CHD_SD", "card size: %llu MiB (capacity=%u sectors, sector_size=%u B)",
-             card_bytes / 1048576ULL, static_cast<unsigned>(card.csd.capacity),
-             static_cast<unsigned>(card.csd.sector_size));
-    SdCheckPartitionTable(&card);
-
-    // Hand the bus back, then let the VFS/FAT layer do its own (identical) card
-    // init - that keeps the FAT step independent from the diagnosis above.
-    sdmmc_host_deinit();
-    vTaskDelay(pdMS_TO_TICKS(50));
-
-    esp_vfs_fat_sdmmc_mount_config_t mount_config = {};
-    mount_config.format_if_mount_failed = false;  // NEVER format
-    mount_config.max_files = 5;
-    mount_config.allocation_unit_size = 16 * 1024;
-
-    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-    host.max_freq_khz = used_freq;
-    sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
-    slot.width = 1;
-    slot.clk = static_cast<gpio_num_t>(kSdClkGpio);
-    slot.cmd = static_cast<gpio_num_t>(kSdCmdGpio);
-    slot.d0 = static_cast<gpio_num_t>(kSdD0Gpio);
-    slot.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
-
-    sdmmc_card_t* mounted_card = nullptr;
-    errno = 0;
-    esp_err_t err = esp_vfs_fat_sdmmc_mount("/sdcard", &host, &slot, &mount_config, &mounted_card);
-    const int mount_errno = errno;
-    ESP_LOGI("CHD_SD", "esp_vfs_fat_sdmmc_mount -> %s (0x%x), errno=%d", ErrName(err),
-             static_cast<unsigned>(err), mount_errno);
-    if (err != ESP_OK) {
-        if (err == ESP_FAIL) {
-            ESP_LOGE("CHD_SD", "card is fine but FAT mount failed -> the data area is not a "
-                               "filesystem this build understands (MBR/exFAT/unformatted). "
-                               "Not formatting (smoke test only).");
-        } else {
-            ESP_LOGE("CHD_SD", "mount failed at the card level (%s) - see the per-stage codes "
-                               "above", ErrName(err));
-        }
-        vTaskDelete(nullptr);
-        return;
-    }
-    ESP_LOGI("CHD_SD", "mount OK");
-
-    uint64_t total = 0, free_bytes = 0;
-    if (esp_vfs_fat_info("/sdcard", &total, &free_bytes) == ESP_OK) {
-        ESP_LOGI("CHD_SD", "capacity: total=%llu KiB free=%llu KiB (%.1f / %.1f MiB)",
-                 total / 1024ULL, free_bytes / 1024ULL, total / 1048576.0,
-                 free_bytes / 1048576.0);
-    } else {
-        ESP_LOGW("CHD_SD", "esp_vfs_fat_info failed");
-    }
-
-    DIR* dir = opendir("/sdcard");
-    if (dir == nullptr) {
-        ESP_LOGW("CHD_SD", "opendir(/sdcard) failed (errno=%d)", errno);
-    } else {
-        struct dirent* entry = nullptr;
-        int shown = 0;
-        while ((entry = readdir(dir)) != nullptr && shown < 10) {
-            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-                continue;
-            }
-            char path[300];
-            snprintf(path, sizeof(path), "/sdcard/%s", entry->d_name);
-            struct stat st = {};
-            if (stat(path, &st) == 0) {
-                ESP_LOGI("CHD_SD", "  [%d] %s%s  %ld B", ++shown, entry->d_name,
-                         S_ISDIR(st.st_mode) ? "/" : "", static_cast<long>(st.st_size));
-            } else {
-                ESP_LOGI("CHD_SD", "  [%d] %s  (stat failed)", ++shown, entry->d_name);
-            }
-        }
-        closedir(dir);
-        if (shown == 0) {
-            ESP_LOGI("CHD_SD", "root directory is empty");
-        }
-    }
-
-    const char* test_path = "/sdcard/_sdtest.txt";
-    FILE* f = fopen(test_path, "w");
-    if (f == nullptr) {
-        ESP_LOGW("CHD_SD", "write test: fopen(w) failed (errno=%d)", errno);
-    } else {
-        const size_t written = fwrite("ok", 1, 2, f);
-        fclose(f);
-        char readback[8] = {0};
-        f = fopen(test_path, "r");
-        size_t got = 0;
-        if (f != nullptr) {
-            got = fread(readback, 1, sizeof(readback) - 1, f);
-            fclose(f);
-        }
-        ESP_LOGI("CHD_SD", "write/read test: wrote=%u read=%u content='%s' -> %s",
-                 static_cast<unsigned>(written), static_cast<unsigned>(got), readback,
-                 (written == 2 && got == 2 && strcmp(readback, "ok") == 0) ? "OK" : "MISMATCH");
-        if (remove(test_path) == 0) {
-            ESP_LOGI("CHD_SD", "cleanup: _sdtest.txt removed");
-        } else {
-            ESP_LOGW("CHD_SD", "cleanup: remove failed (errno=%d)", errno);
-        }
-    }
-    ESP_LOGI("CHD_SD", "smoke test done (card stays mounted at /sdcard)");
-    vTaskDelete(nullptr);
-}
-// task-29 observability: keep the SD bus busy so a "does the card make the
-// device toggle the dialogue on its own?" test is possible on the bench.
-// Started by the MCP tool self.debug.sd_storm; logs CHD_SD: storm lines once a
-// second, so an unexpected CHD_UI: line in between is a real false trigger.
-static volatile bool s_sd_storm_stop = false;
-
-static void SdStormTask(void* arg) {
-    const int seconds = static_cast<int>(reinterpret_cast<intptr_t>(arg));
-    const char* path = "/sdcard/_sdtest_storm.bin";
-    constexpr size_t kChunk = 64 * 1024;
-    static uint8_t chunk[kChunk];
-
-    struct stat st = {};
-    if (stat(path, &st) != 0 || st.st_size < static_cast<off_t>(kChunk)) {
-        FILE* f = fopen(path, "wb");
-        if (f == nullptr) {
-            ESP_LOGE("CHD_SD", "storm: cannot create %s (errno=%d)", path, errno);
-            vTaskDelete(nullptr);
-            return;
-        }
-        memset(chunk, 0xA5, sizeof(chunk));
-        for (int i = 0; i < 8; i++) {  // 512 KiB is plenty to keep the bus busy
-            fwrite(chunk, 1, sizeof(chunk), f);
-        }
-        fclose(f);
-        ESP_LOGI("CHD_SD", "storm: created %s", path);
-    }
-
-    FILE* f = fopen(path, "rb");
-    if (f == nullptr) {
-        ESP_LOGE("CHD_SD", "storm: cannot open %s (errno=%d)", path, errno);
-        vTaskDelete(nullptr);
-        return;
-    }
-    ESP_LOGI("CHD_SD", "storm: START %d s (watch for unexpected CHD_UI lines)", seconds);
-    s_sd_storm_stop = false;
-    size_t bytes_this_second = 0;
-    size_t total    = 0;
-    int elapsed = 0;
-    const TickType_t t0 = xTaskGetTickCount();
-    while (!s_sd_storm_stop) {
-        const size_t got = fread(chunk, 1, sizeof(chunk), f);
-        if (got < sizeof(chunk)) {
-            fseek(f, 0, SEEK_SET);  // wrap around
-        }
-        bytes_this_second += got;
-        total += got;
-        if (xTaskGetTickCount() - t0 >= pdMS_TO_TICKS(1000 * (elapsed + 1))) {
-            elapsed++;
-            ESP_LOGI("CHD_SD", "storm: %d s, %u KiB/s, total %u KiB", elapsed,
-                     static_cast<unsigned>(bytes_this_second / 1024),
-                     static_cast<unsigned>(total / 1024));
-            bytes_this_second = 0;
-            if (elapsed >= seconds) {
-                break;
-            }
-        }
-    }
-    fclose(f);
-    ESP_LOGI("CHD_SD", "storm: STOP after %d s, total %u KiB", elapsed,
-             static_cast<unsigned>(total / 1024));
-    vTaskDelete(nullptr);
-}
-#endif  // CHD_SD_ENABLE#endif  // CHD_SD_ENABLE
 
 // M7-S1: kawaii face + bottom subtitle bar on the 480x320 panel.
 //
@@ -3276,12 +2955,10 @@ static void TouchDiagTask(void* arg) {
 class ChdEsp32s3BoxBoard : public DualNetworkBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
-    // No boot_button_ on purpose (task-29): BOOT (IO0) is also SD_CMD, and the
-    // iot_button GPIO interrupt registered on IO0 fired while the SD bus was
-    // transferring - which toggled the dialogue at random. The physical BOOT pin
-    // is still used by the ROM for download mode (nothing in software touches
-    // it), and the Wi-Fi config-mode fallback does not need a button either
-    // (wifi_board.cc:112 no SSID, :164 60 s timeout).
+    // BOOT (IO0) is ours now that the TF card is gone: it used to be SD_CMD and
+    // the SD traffic made the iot_button interrupt fire at random. Short press =
+    // start/stop talking, long press (3 s) = factory reset.
+    Button boot_button_;
     Display* display_;
     CustomLcdDisplay* touch_display_;
     Esp32Camera* camera_;
@@ -3343,23 +3020,56 @@ private:
         esp_restart();
     }
 
-    // Touch tap = the only "talk" gesture now that the BOOT button is gone.
-    // Also serves as the escape hatch the BOOT button used to provide: while the
-    // device is still starting with Wi-Fi, a tap jumps into config mode.
-    void HandleTap() {
+    // Start/stop talking. Shared by the touch tap and the BOOT button so both
+    // gestures behave identically, including the config-mode escape hatch while
+    // the device is still starting without a saved SSID.
+    void ToggleTalkOrEnterWifiConfig(const char* source) {
         auto& app = Application::GetInstance();
         auto state = app.GetDeviceState();
         if (state == kDeviceStateStarting && GetNetworkType() == NetworkType::WIFI &&
             SsidManager::GetInstance().GetSsidList().empty()) {
-            ESP_LOGI("CHD_UI", "tap -> EnterWifiConfigMode (no saved SSID)");
+            ESP_LOGI("CHD_UI", "%s -> EnterWifiConfigMode (no saved SSID)", source);
             static_cast<WifiBoard&>(GetCurrentBoard()).EnterWifiConfigMode();
             return;
         }
-        ESP_LOGI("CHD_UI", "tap -> ToggleChatState (state=%d)", static_cast<int>(state));
+        ESP_LOGI("CHD_UI", "%s -> ToggleChatState (state=%d)", source,
+                 static_cast<int>(state));
         app.ToggleChatState();
         if (power_save_timer_ != nullptr) {
             power_save_timer_->WakeUp();
         }
+    }
+
+    void HandleTap() { ToggleTalkOrEnterWifiConfig("tap"); }
+
+    // Wipe NVS + otadata and reboot. Deliberately NOT SystemReset: its
+    // constructor calls gpio_config(GPIO_INTR_DISABLE) on the button pins,
+    // which would kill the iot_button interrupt on IO0 and make BOOT dead.
+    void FactoryResetFromBoot() {
+        ESP_LOGW(TAG, "BOOT long-press: factory reset");
+        esp_err_t ret = nvs_flash_erase();
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "nvs_flash_erase failed: %s", esp_err_to_name(ret));
+        }
+        ret = nvs_flash_init();
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "nvs_flash_init failed: %s", esp_err_to_name(ret));
+        }
+        const esp_partition_t* ota = esp_partition_find_first(
+            ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_OTA, nullptr);
+        if (ota != nullptr) {
+            esp_partition_erase_range(ota, 0, ota->size);
+            ESP_LOGI(TAG, "erased otadata partition");
+        } else {
+            ESP_LOGE(TAG, "otadata partition not found");
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        esp_restart();
+    }
+
+    void InitializeBootButton() {
+        boot_button_.OnClick([this]() { ToggleTalkOrEnterWifiConfig("BOOT"); });
+        boot_button_.OnLongPress([this]() { FactoryResetFromBoot(); });
     }
 
     void InitializeDisplay() {
@@ -3961,22 +3671,6 @@ private:
         // on demand (4+ screenshots) instead of waiting for the LLM to happen
         // to emit that emotion. Step 2 decides whether to keep it; remove it
         // if state-driven expressions make it redundant.
-#if CHD_SD_ENABLE
-        // task-29: bench tool - keep the SD bus busy while watching the log for
-        // spontaneous CHD_UI (dialogue) lines.
-        mcp_server.AddTool(
-            "self.debug.sd_storm",
-            "Keep the TF card busy for N seconds (2-300) to check that SD traffic never "
-            "triggers a dialogue toggle. Logs 'CHD_SD: storm' lines once per second.",
-            PropertyList({Property("seconds", kPropertyTypeInteger, 10, 2, 300)}),
-            [](const PropertyList& properties) -> ReturnValue {
-                const int seconds = properties["seconds"].value<int>();
-                const BaseType_t ok = xTaskCreate(
-                    SdStormTask, "sd_storm", 4096,
-                    reinterpret_cast<void*>(static_cast<intptr_t>(seconds)), 2, nullptr);
-                return ok == pdPASS;
-            });
-#endif
         mcp_server.AddTool("self.screen.set_emotion",
             "[debug/spike only - M7 face verification] Set the face expression directly.\n"
             "emotion: one of neutral/listening/happy/laughing/funny/sad/angry/crying/"
@@ -3999,6 +3693,7 @@ private:
 
 public:
     ChdEsp32s3BoxBoard() : DualNetworkBoard(ML307_TX_PIN, ML307_RX_PIN, GPIO_NUM_NC, 0),
+        boot_button_(GPIO_NUM_0, false, 3000, 0, false),
         display_(nullptr), touch_display_(nullptr) {
         InitializeI2c();
         InitializeSpi();
@@ -4009,11 +3704,7 @@ public:
         InitializePowerManager();
         InitializeTools();
         GetBacklight()->RestoreBrightness();
-#if CHD_SD_ENABLE
-        // Non-blocking: the probe runs in its own task so a slow/absent card
-        // cannot delay startup, and a failure only logs a warning.
-        xTaskCreate(SdSmokeTask, "chd_sd", 4096, nullptr, 2, nullptr);
-#endif
+        InitializeBootButton();
     }
 
     virtual AudioCodec* GetAudioCodec() override {

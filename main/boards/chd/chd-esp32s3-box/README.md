@@ -67,16 +67,14 @@ idf.py build
 idf.py flash
 ```
 
-## 触摸交互（task-29：触摸接管，BOOT 键不再参与对话）
+## 触摸交互（2026-11-02：BOOT 键恢复为唤醒键）
 
-### 为什么去掉 BOOT 键的对话用途
-厂商确认 **IO0 = BOOT 键 = SD_CMD**。`boot_button_` 用的是 `iot_button` 的 GPIO 中断，挂在 IO0 上：
-SD 卡高速传输时 CMD 线翻转会被当成按键 → 随机 `ToggleChatState()`（现在没暴露只是因为卡只在启动时读一下）。
-**已彻底移除**：`boot_button_` 成员、`InitializeButtons()`、三个 `HandlePrimaryButton*`、`SetClickHandler` 注册全部删除，
-板级再无 `iot_button` / `BOOT_BUTTON_GPIO` 的代码引用（只剩解释性注释）。
-**仍然保留**：
-- 芯片级下载模式（BOOT 拉低 + 复位）——纯硬件行为，软件不去驱动 IO0；
-- 配网兜底（`wifi_board.cc:112` 无 SSID 自动进配网、`:164` 连接超时 60 s 自动进配网），不依赖按键。
+### 为什么之前没有 BOOT 键、现在有了
+厂商确认 **IO0 = BOOT 键 = SD_CMD**。旧版把 TF 卡接在 IO0 上，SD 传输时 CMD 线翻转会被
+`iot_button` 当成按键 → 随机 `ToggleChatState()`，所以当时把 `boot_button_` 整个删掉了。
+**2026-11-02 起 TF 卡功能取消**（见下节），IO0 归还 BOOT 键，短按唤醒/开始对话比触摸省事。
+注意：**不要用 `SystemReset`**——它的构造函数会对按键引脚 `gpio_config(GPIO_INTR_DISABLE)`，
+把 `iot_button` 的中断关掉，按键会永久失效；恢复出厂逻辑已内联在板级代码里。
 
 ### 手势表（触摸）
 | 手势 | 行为 | 备注 |
@@ -150,60 +148,15 @@ SD 卡高速传输时 CMD 线翻转会被当成按键 → 随机 `ToggleChatStat
 4. 若触摸驱动刷坏导致开机异常：**不用救 UI**，直接按第 1 条重刷上一版镜像即可（本卡改动只在板级两个文件，
    回退只需重刷备份 bin）。
 
-## TF 卡冒烟测试（task-30，仅验证能否挂载，不接业务）
+## TF 卡：已取消（2026-11-02）
 
-引脚来自厂商引脚表（只有 CMD/CLK/DAT0 三根）：
-`SD_CMD=IO0`（同时是 BOOT strap）、`SD_CLK=IO43`（同时 UART0 TXD）、`SD_DAT0=IO44`（同时 UART0 RXD）
-→ **只能 1-bit SDMMC**，没有卡检测脚 → 当常驻卡处理，不做热插拔。
+厂商引脚表里 `SD_CMD=IO0`（同时是 **BOOT strap**）、`SD_CLK=IO43`（UART0 TXD）、`SD_DAT0=IO44`
+（UART0 RXD）。为了把 IO0 还给 BOOT 键（触摸唤醒太费劲），本板**移除全部 TF/SD 代码**：
+`CHD_SD_ENABLE` 宏、探测任务、`self.debug.sd_storm` 工具与相关 include 都已删除。
 
-### 行为（rev2：分阶段诊断）
-- 板级构造函数末尾 `xTaskCreate(chd_sd)`（栈 4096、优先级 2）：**探测在独立任务里跑，卡慢/没卡都不影响启动**。
-- **阶段 0 引脚体检**：三根线设成输入 + 上拉，打印电平 —— 上拉还读到 0 说明被卡/BOOT 按键电路拉住。
-- **阶段 1–3 逐级打码**：`sdmmc_host_init()` → `sdmmc_host_init_slot()` → `sdmmc_card_init()`，
-  每步打 `esp_err_to_name` + 十六进制码。`card_init` 成功 = 接线/时序没问题，随即打印 `sdmmc_card_print_info` 与容量。
-- **两级频率 × 3 轮**：先 `SDMMC_FREQ_PROBING`(400 kHz)、再 `SDMMC_FREQ_DEFAULT`(20 MHz)，每次之间 `vTaskDelay(200 ms)`。
-  400 kHz 过、20 MHz 不过 ⇒ 信号完整性；两级都不过 ⇒ 接线/供电/无卡。
-- **分区表探测**：`sdmmc_read_sectors(card, buf, 0, 1)` 读扇区 0，判 0x55AA 魔数，打 `partition table (sector 0): PRESENT/ABSENT`
-  —— 用来区分「卡正常但没文件系统」与「卡根本没应答」。
-- 然后 `esp_vfs_fat_sdmmc_mount`（`format_if_mount_failed=false`，**绝不格式化**），失败单独打错误码 + `errno`。
-- 挂载点 `/sdcard`；失败后继续正常当语音助手用（只 `ESP_LOGE`/`ESP_LOGW`）。
-
-### 错误码怎么读（已核 IDF 6.1 源码）
-- `esp_vfs_fat_sdmmc_mount` 返回 **`ESP_FAIL (0xffffffff)` ⇔ 卡初始化成功、但 `f_mount` 不认这个文件系统**
-  （`components/fatfs/vfs/vfs_fat_sdmmc.c:109`：`res != FR_OK` 才置 ESP_FAIL）。
-  卡初始化失败会**原样透传自己的错误码**（同文件 `:253` `sdmmc_card_init` + `sdmmc_card_init failed` 日志），
-  所以「看到 ESP_FAIL 但没看到 sdmmc_card_init failed」= 接线 OK。
-- **本固件不支持 exFAT**：`components/fatfs/src/ffconf.h:294` 是 `#define FF_FS_EXFAT 0`（IDF 6.1 里没有 Kconfig 开关）。
-  ≥64 GB 卡出厂多为 exFAT → 必然 `ESP_FAIL`。**解决：在电脑上把卡格式化成 FAT32**（或用 ≤32 GB 卡），
-  不要在设备上格式化（我们保持 `format_if_mount_failed=false`）。
-
-### 实测记录
-- 2026-10-28：插卡刷 rev1 → `CHD_SD: mount failed: ESP_FAIL (0xffffffff)`，无 `sdmmc_card_init failed`
-  → 按上面口径，接线/时序 OK，问题在文件系统。
-- **IO0 boot strap 风险实测未发生**：启动日志 `rst:0x15 (USB_UART_CHIP_RESET), boot:0x28 (SPI_FAST_FLASH_BOOT)`
-  → 卡在复位瞬间没有把 CMD(IO0) 拉低，正常进 app、无 panic。
-- 成功：打印 `sdmmc_card_print_info`（卡类型/容量）→ `esp_vfs_fat_info`（总量/剩余）→ 根目录前 10 项（名字+大小）
-  → 写 `/sdcard/_sdtest.txt`（"ok"）→ 读回比对 → 删除。全部用 tag **`CHD_SD`**，一次打印不循环。
-
-### 一键关掉（紧急开关）
-文件顶部有：
-```c
-#ifndef CHD_SD_ENABLE
-#define CHD_SD_ENABLE 1     // 改成 0 或 -DCHD_SD_ENABLE=0 即完全不碰 IO0/IO43/IO44
-#endif
-```
-已在本地验证：`CHD_SD_ENABLE 0` 时构建 EXIT=0，`xiaozhi.bin` 回到 **2,805,088 B**（与加 SD 前逐字节同尺寸，
-说明 FAT/SDMMC 全部没链接进去）。**若刷了 SD 版开不了机，用这个 0 版本重刷即可。**
-
-### 已知风险（必读）
-1. **IO0 是 boot strap**：复位瞬间若卡把 CMD 拉低，芯片会进下载模式 → 现象是"刷完不启动、串口只出
-   `waiting for download`"或完全没有启动日志（不是 panic、没有 backtrace）。此时**不能用普通复位救**，
-   需要按住 BOOT + 按 RST 进下载模式重刷（`CHD_SD_ENABLE 0` 版或备份镜像）。
-2. **IO43/IO44 与 UART0 控制台冲突**：SD 驱动占用这两根后，**UART0 串口日志会乱码/中断**。
-   本板 `CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y`，所以日志仍能从 **USB-Serial-JTAG** 看，
-   刷机/看日志请走 USB 口（`/dev/cu.usbmodem*`）。
-3. 卡与摄像头**引脚并不冲突**：TF 用 IO0/IO43/IO44，摄像头用 IO9-14/21/38-42，两组不相交。
-   厂商 readme 说的「复用」指两者都与 PZ 扩展排针复用。见 `docs/board-hardware-notes.md`。
+- **IO0**：归 BOOT 键（短按对话、长按 3 s 恢复出厂）。
+- **IO43/IO44**：不再被 SD 驱动占用，UART0 控制台可正常用（之前 SD 占用时日志会乱码）。
+- 想恢复 TF 卡：从 git 历史找回 `chd_esp32s3_box_board.cc` 里的 SD 代码块，并接受它与 BOOT 键抢 IO0。
 
 ## 字幕层（LVGL 变体：`chd-esp32s3-box-lcd35`）
 
@@ -312,15 +265,16 @@ y 312..320   底部留白 8
 
 ## 按键说明
 
-### Boot 按键功能
+### Boot 按键功能（2026-11-02 起）
 
-#### 单击
-- **配网状态**: 进入 WiFi 配置模式
-- **空闲状态**: 开始对话
-- **对话中**: 打断或停止当前对话
+#### 短按（< 3 s）
+- **配网状态（无已保存 SSID）**: 进入 WiFi 配置模式
+- **空闲状态**: 开始一轮对话（唤醒）
+- **对话中**: 打断 / 结束当前对话
 
-#### 双击 (需启用设备端 AEC)
-- **空闲状态**: 切换 AEC 开启/关闭
+#### 长按（≥ 3 s）
+- **恢复出厂**：擦除 NVS（Wi-Fi/OTA 地址全丢）+ 擦 otadata，1 秒后自动重启。
+  重启后设备回到配网模式（`Xiaozhi-XXXX` 热点）。
 
 ## 常见问题
 
@@ -328,7 +282,7 @@ y 312..320   底部留白 8
 设备端 AEC 可以在本地实时消除扬声器播放声音对麦克风的干扰，在播放音乐或 TTS 回复时仍能准确识别语音指令。
 
 ### 3. 如何恢复出厂设置？
-按 Boot 按键 5次，设备会清除所有配置并重启。
+长按 BOOT 键 ≥ 3 秒：擦除所有配置（Wi-Fi、OTA 地址）并重启，随后进入配网模式。
 
 ### 4. A 视图底部的恐龙条不见了？
 先确认板上跑的是不是新镜像——2026-10-30 的现场是**旧 app 留在板上**，换成新编的 app 后
