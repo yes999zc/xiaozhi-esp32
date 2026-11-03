@@ -3,6 +3,7 @@
 #include "board.h"
 #include "settings.h"
 #include "system_info.h"
+#include "sdkconfig.h"
 
 #include <esp_log.h>
 #include <arpa/inet.h>
@@ -88,6 +89,11 @@ bool WebsocketProtocol::OpenAudioChannel() {
     Settings settings("websocket", false);
     std::string url = settings.GetString("url");
     std::string token = settings.GetString("token");
+    // A private build pins the paired device secret. The anonymous OTA endpoint
+    // only returns the URL, so it cannot disclose or overwrite this token.
+    if (CONFIG_XIAOZHI_DEVICE_TOKEN[0] != '\0') {
+        token = CONFIG_XIAOZHI_DEVICE_TOKEN;
+    }
     int version = settings.GetInt("version");
     if (version != 0) {
         version_ = version;
@@ -117,27 +123,52 @@ bool WebsocketProtocol::OpenAudioChannel() {
         if (binary) {
             if (on_incoming_audio_ != nullptr) {
                 if (version_ == 2) {
-                    BinaryProtocol2* bp2 = (BinaryProtocol2*)data;
-                    bp2->version = ntohs(bp2->version);
-                    bp2->type = ntohs(bp2->type);
-                    bp2->timestamp = ntohl(bp2->timestamp);
-                    bp2->payload_size = ntohl(bp2->payload_size);
-                    auto payload = (uint8_t*)bp2->payload;
+                    constexpr size_t kHeaderSize = sizeof(BinaryProtocol2);
+                    if (len < kHeaderSize) {
+                        ESP_LOGW(TAG, "Short v2 audio frame: %zu bytes", len);
+                        return;
+                    }
+                    uint16_t raw_version = 0;
+                    uint16_t raw_type = 0;
+                    uint32_t raw_timestamp = 0;
+                    uint32_t raw_payload_size = 0;
+                    memcpy(&raw_version, data, sizeof(raw_version));
+                    memcpy(&raw_type, data + 2, sizeof(raw_type));
+                    memcpy(&raw_timestamp, data + 8, sizeof(raw_timestamp));
+                    memcpy(&raw_payload_size, data + 12, sizeof(raw_payload_size));
+                    const uint32_t payload_size = ntohl(raw_payload_size);
+                    if (ntohs(raw_version) != 2 || ntohs(raw_type) != 0 ||
+                        payload_size != len - kHeaderSize) {
+                        ESP_LOGW(TAG, "Invalid v2 audio frame: %zu bytes, payload=%lu", len,
+                                 static_cast<unsigned long>(payload_size));
+                        return;
+                    }
+                    const auto* payload = reinterpret_cast<const uint8_t*>(data + kHeaderSize);
                     on_incoming_audio_(std::make_unique<AudioStreamPacket>(AudioStreamPacket{
                         .sample_rate = server_sample_rate_,
                         .frame_duration = server_frame_duration_,
-                        .timestamp = bp2->timestamp,
-                        .payload = std::vector<uint8_t>(payload, payload + bp2->payload_size)}));
+                        .timestamp = ntohl(raw_timestamp),
+                        .payload = std::vector<uint8_t>(payload, payload + payload_size)}));
                 } else if (version_ == 3) {
-                    BinaryProtocol3* bp3 = (BinaryProtocol3*)data;
-                    bp3->type = bp3->type;
-                    bp3->payload_size = ntohs(bp3->payload_size);
-                    auto payload = (uint8_t*)bp3->payload;
+                    constexpr size_t kHeaderSize = sizeof(BinaryProtocol3);
+                    if (len < kHeaderSize) {
+                        ESP_LOGW(TAG, "Short v3 audio frame: %zu bytes", len);
+                        return;
+                    }
+                    uint16_t raw_payload_size = 0;
+                    memcpy(&raw_payload_size, data + 2, sizeof(raw_payload_size));
+                    const uint16_t payload_size = ntohs(raw_payload_size);
+                    if (static_cast<uint8_t>(data[0]) != 0 || payload_size != len - kHeaderSize) {
+                        ESP_LOGW(TAG, "Invalid v3 audio frame: %zu bytes, payload=%u", len,
+                                 static_cast<unsigned>(payload_size));
+                        return;
+                    }
+                    const auto* payload = reinterpret_cast<const uint8_t*>(data + kHeaderSize);
                     on_incoming_audio_(std::make_unique<AudioStreamPacket>(AudioStreamPacket{
                         .sample_rate = server_sample_rate_,
                         .frame_duration = server_frame_duration_,
                         .timestamp = 0,
-                        .payload = std::vector<uint8_t>(payload, payload + bp3->payload_size)}));
+                        .payload = std::vector<uint8_t>(payload, payload + payload_size)}));
                 } else {
                     on_incoming_audio_(std::make_unique<AudioStreamPacket>(AudioStreamPacket{
                         .sample_rate = server_sample_rate_,

@@ -6,6 +6,13 @@ config OTA_URL
     help
         The application will access this URL to check for new firmwares and server address.
 
+config XIAOZHI_DEVICE_TOKEN
+    string "Private WebSocket pairing token"
+    default ""
+    help
+        A private build can set this to the local server's device.token value.
+        Do not include a paired image in a public release.
+
 choice
     prompt "Flash Assets"
     default FLASH_DEFAULT_ASSETS if !USE_EMOTE_MESSAGE_STYLE

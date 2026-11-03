@@ -19,6 +19,10 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
 #include <cstring>
 #include <expected>
 #include <system_error>
@@ -205,19 +209,34 @@ NetworkResult<> Ota::CheckVersion() {
         cJSON *timezone_offset = cJSON_GetObjectItem(server_time, "timezone_offset");
         
         if (cJSON_IsNumber(timestamp)) {
-            // 设置系统时间
-            struct timeval tv;
-            double ts = timestamp->valuedouble;
-            
-            // 如果有时区偏移，计算本地时间
-            if (cJSON_IsNumber(timezone_offset)) {
-                ts += (timezone_offset->valueint * 60 * 1000); // 转换分钟为毫秒
+            // Unix time is always UTC. Set TZ separately so localtime() renders
+            // the server's local clock without shifting time() and TLS checks.
+            const double ts = timestamp->valuedouble;
+            constexpr double kMinEpochMs = 946684800000.0;   // 2000-01-01 UTC
+            constexpr double kMaxEpochMs = 4102444800000.0;  // 2100-01-01 UTC
+            if (!std::isfinite(ts) || ts < kMinEpochMs || ts >= kMaxEpochMs) {
+                ESP_LOGW(TAG, "Ignoring invalid server timestamp");
+            } else {
+                if (cJSON_IsNumber(timezone_offset) &&
+                    timezone_offset->valueint >= -24 * 60 &&
+                    timezone_offset->valueint <= 24 * 60) {
+                    const int minutes_east = timezone_offset->valueint;
+                    const int abs_minutes = std::abs(minutes_east);
+                    char tz[24];
+                    snprintf(tz, sizeof(tz), "UTC%c%d:%02d", minutes_east >= 0 ? '-' : '+',
+                             abs_minutes / 60, abs_minutes % 60);
+                    setenv("TZ", tz, 1);
+                    tzset();
+                }
+                struct timeval tv = {};
+                tv.tv_sec = static_cast<time_t>(ts / 1000);
+                tv.tv_usec = static_cast<suseconds_t>(static_cast<int64_t>(ts) % 1000) * 1000;
+                if (settimeofday(&tv, nullptr) == 0) {
+                    has_server_time_ = true;
+                } else {
+                    ESP_LOGW(TAG, "Failed to set system time");
+                }
             }
-            
-            tv.tv_sec = (time_t)(ts / 1000);  // 转换毫秒为秒
-            tv.tv_usec = (suseconds_t)((long long)ts % 1000) * 1000;  // 剩余的毫秒转换为微秒
-            settimeofday(&tv, NULL);
-            has_server_time_ = true;
         }
     } else {
         ESP_LOGW(TAG, "No server_time section found!");

@@ -154,6 +154,18 @@ void Application::Initialize() {
         Schedule([this, status]() { HandleMuteStateChanged(status); });
     });
     mute_controller_->SetTokenRefreshCallback([this]() { RequestMuteTokenRefresh(); });
+    mute_controller_->SetWakeCallback([this](const std::string& wake_id) {
+        Schedule([this, wake_id]() {
+            if (GetDeviceState() != kDeviceStateIdle || audio_service_.IsMuteHeld()) {
+                ESP_LOGW(TAG, "remote wake deferred: device is busy or muted");
+                mute_controller_->OnWakeHandled(wake_id, false);
+                return;
+            }
+            ESP_LOGI(TAG, "remote wake -> ToggleChatState");
+            ToggleChatState();
+            mute_controller_->OnWakeHandled(wake_id, true);
+        });
+    });
     mute_controller_->Start();
     // Reflect the controller's initial state (kFailed too, e.g. if the task
     // could not be created) instead of assuming kSyncing.
@@ -977,9 +989,13 @@ void Application::HandleMuteStateChanged(const MuteStatus& status) {
     if (status.state == MuteSyncState::kSynced || status.state == MuteSyncState::kFailed) {
         startup_mute_result_seen_ = true;
     }
-    // While muted the device must not capture or send, but the WS stays up so
-    // the server can still push JSON (the socket is not touched here).
-    const bool hold = status.muted;
+    // Once a control endpoint is known, fail closed until the server confirms
+    // an unmuted state. A failed boot poll must not enable microphone uplink.
+    // A brand-new board without an endpoint can still open its first WS session
+    // to receive the control capability; no remote mute is configured yet.
+    const bool hold = status.muted ||
+                      (mute_controller_ && mute_controller_->HasEndpoint() &&
+                       status.state != MuteSyncState::kSynced);
     if (hold != audio_service_.IsMuteHeld()) {
         audio_service_.SetMuteHold(hold);
         if (hold) {
@@ -995,7 +1011,8 @@ void Application::HandleMuteStateChanged(const MuteStatus& status) {
             mute_last_input_count_ = audio_service_.GetInputFrameCount();
             mute_last_encode_count_ = audio_service_.GetEncodedFrameCount();
             mute_tx_frames_since_log_ = 0;
-            ESP_LOGW(TAG, "mute: server-confirmed muted, capture/uplink held");
+            ESP_LOGW(TAG, "mute: capture/uplink held (muted=%d sync=%d)",
+                     status.muted ? 1 : 0, static_cast<int>(status.state));
         } else {
             // Restore the wake engine regardless of the current state: a mute
             // cycle can end while the state machine is still listening or

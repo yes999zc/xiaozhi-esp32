@@ -69,6 +69,11 @@ void MuteController::SetTokenRefreshCallback(TokenRefreshCallback callback) {
     token_refresh_callback_ = std::move(callback);
 }
 
+void MuteController::SetWakeCallback(WakeCallback callback) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    wake_callback_ = std::move(callback);
+}
+
 void MuteController::Start() {
     std::string endpoint_for_log;
     bool token_stored = false;
@@ -221,6 +226,19 @@ void MuteController::OnTokenRefreshFinished(bool ok) {
     ESP_LOGI(TAG, "token refresh finished: channel=%s", ok ? "open" : "failed");
 }
 
+void MuteController::OnWakeHandled(const std::string& wake_id, bool accepted) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (wake_in_flight_id_ != wake_id) {
+        return;
+    }
+    if (accepted) {
+        last_wake_id_ = wake_id;
+        trigger_ = true;
+        cv_.notify_all();
+    }
+    wake_in_flight_id_.clear();
+}
+
 MuteStatus MuteController::status() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return MuteStatus{last_confirmed_muted_, state_, have_result_};
@@ -315,7 +333,8 @@ void MuteController::TaskLoop() {
         }
 
         bool muted_out = false;
-        const SyncResult result = PerformSync(do_toggle, target_muted, &muted_out);
+        std::string wake_id;
+        const SyncResult result = PerformSync(do_toggle, target_muted, &muted_out, &wake_id);
 
         int64_t delay_ms = 0;
         bool publish = false;
@@ -430,17 +449,32 @@ void MuteController::TaskLoop() {
         if (publish) {
             PublishState();
         }
+        WakeCallback wake_cb;
+        if (result == SyncResult::kOk && !muted_out && !wake_id.empty()) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (wake_id != last_wake_id_ && wake_in_flight_id_.empty() && wake_callback_) {
+                wake_in_flight_id_ = wake_id;
+                wake_cb = wake_callback_;
+            }
+        }
+        if (wake_cb) {
+            ESP_LOGI(TAG, "remote wake received: %s", wake_id.c_str());
+            wake_cb(wake_id);
+        }
     }
 }
 
 MuteController::SyncResult MuteController::PerformSync(bool do_toggle, bool target_muted,
-                                                       bool* muted_out) {
+                                                       bool* muted_out,
+                                                       std::string* wake_id_out) {
     std::string base_url;
     std::string token;
+    std::string wake_ack;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         base_url = base_url_;
         token = token_;
+        wake_ack = last_wake_id_;
     }
     if (base_url.empty() || token.empty()) {
         return SyncResult::kNetwork;
@@ -462,6 +496,10 @@ MuteController::SyncResult MuteController::PerformSync(bool do_toggle, bool targ
     http->SetHeader("Authorization", "Bearer " + token);
     http->SetHeader("Accept", "application/json");
     http->SetHeader("Content-Type", "application/json");
+    http->SetHeader("X-Wake-Poll", "1");
+    if (!wake_ack.empty()) {
+        http->SetHeader("X-Wake-Ack", wake_ack);
+    }
 
     if (do_toggle) {
         // Explicit boolean, never a toggle/ops verb (the server validates a
@@ -504,6 +542,10 @@ MuteController::SyncResult MuteController::PerformSync(bool do_toggle, bool targ
     const cJSON* muted = cJSON_GetObjectItem(root, "muted");
     const bool parsed = cJSON_IsBool(muted);
     const bool value = parsed && cJSON_IsTrue(muted);
+    const cJSON* wake = cJSON_GetObjectItem(root, "wake_id");
+    if (cJSON_IsString(wake) && wake->valuestring != nullptr) {
+        *wake_id_out = wake->valuestring;
+    }
     cJSON_Delete(root);
     if (!parsed) {
         ESP_LOGW(TAG, "response has no boolean `muted`");

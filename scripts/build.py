@@ -411,7 +411,7 @@ _COMMON_CAMERA_CONSTRUCTOR_RE = re.compile(
 
 def _expand_ota_base(items: list[str]) -> list[str]:
     """Expand the non-secret OTA base placeholder at build time."""
-    base = os.environ.get("XIAOZHI_OTA_BASE", "")
+    base = (os.environ.get("XIAOZHI_OTA_BASE") or "http://rui-ota.invalid:4411").rstrip("/")
     return [item.replace("${XIAOZHI_OTA_BASE}", base) for item in items]
 
 
@@ -1573,7 +1573,7 @@ def build_board(
         final_name = _get_release_full_name(manufacturer, build)
 
         # Process sdkconfig_append
-        build_sdkconfig_append = build.get("sdkconfig_append", [])
+        build_sdkconfig_append = _expand_ota_base(build.get("sdkconfig_append", []))
         explicit_board_cfg = _extract_board_config_from_sdkconfig_append(build_sdkconfig_append)
         board_type_config = _resolve_board_config(
             board_type,

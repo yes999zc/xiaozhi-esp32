@@ -54,10 +54,12 @@ public:
     // reopens the WS once to receive a fresh MCP initialize; any mute hold
     // stays applied, so this only refreshes the control token.
     using TokenRefreshCallback = std::function<void()>;
+    using WakeCallback = std::function<void(const std::string& wake_id)>;
 
     // Must be called before Start().
     void SetStateCallback(StateCallback callback);
     void SetTokenRefreshCallback(TokenRefreshCallback callback);
+    void SetWakeCallback(WakeCallback callback);
 
     void Start();
     void Stop();
@@ -79,6 +81,9 @@ public:
     // Reported by the application after the one-shot WS reopen triggered by
     // TokenRefreshCallback. `ok` only means a fresh channel/hello was obtained.
     void OnTokenRefreshFinished(bool ok);
+    // Called by the application main task after it accepts or defers a wake.
+    // Only an accepted command is acknowledged on the next HTTP poll.
+    void OnWakeHandled(const std::string& wake_id, bool accepted);
 
     MuteStatus status() const;
 
@@ -92,7 +97,8 @@ private:
 
     static void TaskTrampoline(void* arg);
     void TaskLoop();
-    SyncResult PerformSync(bool do_toggle, bool target_muted, bool* muted_out);
+    SyncResult PerformSync(bool do_toggle, bool target_muted, bool* muted_out,
+                           std::string* wake_id_out);
     void PublishState();
     static int64_t NowMs();
 
@@ -103,6 +109,9 @@ private:
 
     StateCallback state_callback_;
     TokenRefreshCallback token_refresh_callback_;
+    WakeCallback wake_callback_;
+    std::string last_wake_id_;  // protected by mutex_; acknowledged on next poll
+    std::string wake_in_flight_id_;  // scheduled on the application main task
 
     // Endpoint (NVS-persisted; never includes the muted flag).
     std::string base_url_;
