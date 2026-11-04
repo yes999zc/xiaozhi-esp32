@@ -6,6 +6,13 @@
         {
             "name": "xingzhi-cube-1.54tft-wifi",
             "sdkconfig_append": []
+        },
+        {
+            "name": "desk-mate-cube",
+            "sdkconfig_append": [
+                "CONFIG_DESK_MATE_CUBE=y",
+                "CONFIG_OTA_URL=\"${XIAOZHI_OTA_BASE}/xiaozhi/ota/\""
+            ]
         }
     ]
 }

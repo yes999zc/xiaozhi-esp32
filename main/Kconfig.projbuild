@@ -13,6 +13,13 @@ config XIAOZHI_DEVICE_TOKEN
         A private build can set this to the local server's device.token value.
         Do not include a paired image in a public release.
 
+config DESK_MATE_CUBE
+    bool "Desk Mate Cube interface"
+    depends on BOARD_TYPE_XINGZHI_CUBE_1_54TFT_WIFI
+    default n
+    help
+        Use the Desk Mate single-screen interface and Cube button mapping.
+
 choice
     prompt "Flash Assets"
     default FLASH_DEFAULT_ASSETS if !USE_EMOTE_MESSAGE_STYLE

@@ -9,12 +9,16 @@
 #include "led/single_led.h"
 #include "assets/lang_config.h"
 #include "power_manager.h"
+#if CONFIG_DESK_MATE_CUBE
+#include "desk_mate_cube_display.h"
+#endif
 
 #include <esp_log.h>
 #include <esp_lcd_panel_vendor.h>
 
 #include <driver/rtc_io.h>
 #include <esp_sleep.h>
+#include <algorithm>
 
 #define TAG "XINGZHI_CUBE_1_54TFT_WIFI"
 
@@ -77,6 +81,55 @@ private:
     }
 
     void InitializeButtons() {
+#if CONFIG_DESK_MATE_CUBE
+        // Button callbacks run outside the application task. Schedule control
+        // actions on that task; the side power/reset key is hardware controlled.
+        boot_button_.OnClick([this]() {
+            Application::GetInstance().Schedule([this]() {
+                power_save_timer_->WakeUp();
+                auto& app = Application::GetInstance();
+                if (app.GetDeviceState() == kDeviceStateStarting) {
+                    EnterWifiConfigMode();
+                } else {
+                    app.ToggleChatState();
+                }
+            });
+        });
+        volume_up_button_.OnClick([this]() {
+            Application::GetInstance().Schedule([this]() {
+                power_save_timer_->WakeUp();
+                auto* codec = GetAudioCodec();
+                int volume = std::min(100, codec->output_volume() + 10);
+                codec->SetOutputVolume(volume);
+                GetDisplay()->ShowNotification(Lang::Strings::VOLUME + std::to_string(volume));
+            });
+        });
+        volume_down_button_.OnClick([this]() {
+            Application::GetInstance().Schedule([this]() {
+                power_save_timer_->WakeUp();
+                auto* codec = GetAudioCodec();
+                int volume = std::max(0, codec->output_volume() - 10);
+                codec->SetOutputVolume(volume);
+                GetDisplay()->ShowNotification(Lang::Strings::VOLUME + std::to_string(volume));
+            });
+        });
+        volume_up_button_.OnLongPress([this]() {
+            Application::GetInstance().Schedule([this]() {
+                power_save_timer_->WakeUp();
+                auto* backlight = GetBacklight();
+                int value = backlight->brightness();
+                value = value < 40 ? 65 : (value < 80 ? 100 : 30);
+                backlight->SetBrightness(value, true);
+                GetDisplay()->ShowNotification(std::string("亮度 ") + std::to_string(value) + "%");
+            });
+        });
+        volume_down_button_.OnLongPress([this]() {
+            Application::GetInstance().Schedule([this]() {
+                power_save_timer_->WakeUp();
+                Application::GetInstance().ToggleMute();
+            });
+        });
+#else
         boot_button_.OnClick([this]() {
             power_save_timer_->WakeUp();
             auto& app = Application::GetInstance();
@@ -120,6 +173,7 @@ private:
             GetAudioCodec()->SetOutputVolume(0);
             GetDisplay()->ShowNotification(Lang::Strings::MUTED);
         });
+#endif
     }
 
     void InitializeSt7789Display() {
@@ -146,15 +200,25 @@ private:
         ESP_ERROR_CHECK(esp_lcd_panel_mirror(panel_, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y));
         ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_, true));
 
-        display_ = new SpiLcdDisplay(panel_io_, panel_, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, 
+#if CONFIG_DESK_MATE_CUBE
+        display_ = new DeskMateCubeDisplay(panel_io_, panel_, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y,
             DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+#else
+        display_ = new SpiLcdDisplay(panel_io_, panel_, DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y,
+            DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+#endif
     }
 
 public:
     XINGZHI_CUBE_1_54TFT_WIFI() :
         boot_button_(BOOT_BUTTON_GPIO),
+#if CONFIG_DESK_MATE_CUBE
+        volume_up_button_(VOLUME_UP_BUTTON_GPIO, false, 1500),
+        volume_down_button_(VOLUME_DOWN_BUTTON_GPIO, false, 1500) {
+#else
         volume_up_button_(VOLUME_UP_BUTTON_GPIO),
         volume_down_button_(VOLUME_DOWN_BUTTON_GPIO) {
+#endif
         InitializePowerManager();
         InitializePowerSaveTimer();
         InitializeSpi();
